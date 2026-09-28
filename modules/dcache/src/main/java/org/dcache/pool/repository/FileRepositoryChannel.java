@@ -1,6 +1,5 @@
 package org.dcache.pool.repository;
 
-import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.SyncFailedException;
@@ -17,42 +16,31 @@ import java.util.Set;
 public class FileRepositoryChannel implements RepositoryChannel {
 
     private static final FileAttribute<?>[] NO_ATTRIBUTES = new FileAttribute<?>[0];
+    private static final int BUFFER_SIZE = 16777216;
 
     private final FileChannel _fileChannel;
-
-    /*
-     * Cached value of files size. If value is -1, then we have to get file size
-     * by querying the underlying file system.
-     */
     private final long _fileSize;
+    private ByteBuffer _writeBuffer;
 
-    /**
-     * Creates a {@link RepositoryChannel} to read from, and optionally to write to, the file
-     * specified by the {@link File} argument.
-     *
-     * @param path        the file object
-     * @param openOptions Options specifying how the file is opened
-     * @throws FileNotFoundException if the mode is <tt>"r"</tt> but the given file object does not
-     *                               denote an existing regular file, or if the mode begins with
-     *                               <tt>"rw"</tt> but the given file object does not denote an
-     *                               existing, writable regular file and a new regular file of that
-     *                               name cannot be created, or if some other error occurs while
-     *                               opening or creating the file
-     */
     public FileRepositoryChannel(Path path, Set<? extends OpenOption> openOptions)
           throws FileNotFoundException, IOException {
         _fileChannel = FileChannel.open(path, openOptions, NO_ATTRIBUTES);
         _fileSize = !openOptions.contains(StandardOpenOption.WRITE) ? _fileChannel.size() : -1;
+        if (openOptions.contains(StandardOpenOption.WRITE)) {
+            _writeBuffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
+            _writeBuffer.clear();
+        }
     }
 
     @Override
     public long position() throws IOException {
-        return _fileChannel.position();
+        return _fileChannel.position() + (_writeBuffer != null ? _writeBuffer.position() : 0);
     }
 
     @Override
-    public RepositoryChannel position(long position) throws IOException {
-        _fileChannel.position(position);
+    public RepositoryChannel position(long p) throws IOException {
+        flushWriteBuffer();
+        _fileChannel.position(p);
         return this;
     }
 
@@ -63,17 +51,20 @@ public class FileRepositoryChannel implements RepositoryChannel {
 
     @Override
     public void sync() throws SyncFailedException, IOException {
+        flushWriteBuffer();
         _fileChannel.force(false);
     }
 
     @Override
     public RepositoryChannel truncate(long size) throws IOException {
+        flushWriteBuffer();
         _fileChannel.truncate(size);
         return this;
     }
 
     @Override
     public void close() throws IOException {
+        flushWriteBuffer();
         _fileChannel.close();
     }
 
@@ -88,13 +79,13 @@ public class FileRepositoryChannel implements RepositoryChannel {
     }
 
     @Override
-    public int read(ByteBuffer buffer, long position) throws IOException {
-        return _fileChannel.read(buffer, position);
+    public int read(ByteBuffer b, long pos) throws IOException {
+        return _fileChannel.read(b, pos);
     }
 
     @Override
-    public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
-        return _fileChannel.read(dsts, offset, length);
+    public long read(ByteBuffer[] dsts, int off, int len) throws IOException {
+        return _fileChannel.read(dsts, off, len);
     }
 
     @Override
@@ -102,35 +93,80 @@ public class FileRepositoryChannel implements RepositoryChannel {
         return _fileChannel.read(dsts);
     }
 
+    private void flushWriteBuffer() throws IOException {
+        if (_writeBuffer != null && _writeBuffer.position() > 0) {
+            _writeBuffer.flip();
+            while (_writeBuffer.hasRemaining()) {
+                _fileChannel.write(_writeBuffer);
+            }
+            _writeBuffer.clear();
+        }
+    }
+
     @Override
     public int write(ByteBuffer src) throws IOException {
-        return _fileChannel.write(src);
+        if (_writeBuffer == null) {
+            return _fileChannel.write(src);
+        }
+        int totalWritten = src.remaining();
+        while (src.hasRemaining()) {
+            int space = _writeBuffer.remaining();
+            if (space == 0) {
+                flushWriteBuffer();
+                space = _writeBuffer.remaining();
+            }
+            int chunk = Math.min(space, src.remaining());
+            int oldLimit = src.limit();
+            src.limit(src.position() + chunk);
+            _writeBuffer.put(src);
+            src.limit(oldLimit);
+        }
+        return totalWritten;
     }
 
     @Override
-    public int write(ByteBuffer buffer, long position) throws IOException {
-        return _fileChannel.write(buffer, position);
+    public int write(ByteBuffer b, long pos) throws IOException {
+        flushWriteBuffer();
+        return _fileChannel.write(b, pos);
     }
 
     @Override
-    public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
-        return _fileChannel.write(srcs, offset, length);
+    public long write(ByteBuffer[] srcs, int off, int len) throws IOException {
+        flushWriteBuffer();
+        return _fileChannel.write(srcs, off, len);
     }
 
     @Override
     public long write(ByteBuffer[] srcs) throws IOException {
+        flushWriteBuffer();
         return _fileChannel.write(srcs);
     }
 
     @Override
-    public long transferTo(long position, long count, WritableByteChannel target)
-          throws IOException {
-        return _fileChannel.transferTo(position, count, target);
+    public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
+        long pos = position;
+        long remaining = count;
+        while (remaining > 0) {
+            int chunk = (int) Math.min(remaining, BUFFER_SIZE);
+            buffer.clear();
+            buffer.limit(chunk);
+            if (_fileChannel.read(buffer, pos) < 0) {
+                break;
+            }
+            buffer.flip();
+            int nw = target.write(buffer);
+            if (nw <= 0) {
+                break;
+            }
+            pos += nw;
+            remaining -= nw;
+        }
+        return count - remaining;
     }
 
     @Override
-    public long transferFrom(ReadableByteChannel src, long position, long count)
-          throws IOException {
-        return _fileChannel.transferFrom(src, position, count);
+    public long transferFrom(ReadableByteChannel src, long pos, long count) throws IOException {
+        return _fileChannel.transferFrom(src, pos, count);
     }
 }
